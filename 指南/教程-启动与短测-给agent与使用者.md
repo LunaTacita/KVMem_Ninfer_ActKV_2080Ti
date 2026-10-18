@@ -68,7 +68,7 @@ $r = Invoke-WebRequest -Uri http://127.0.0.1:8080/v1/chat/completions -Method Po
 ($r.Content | ConvertFrom-Json).usage
 ```
 
-### 2.2 读引擎自己的两行证据（stderr / logs\*.err.log）
+### 2.2 读引擎自己的两行证据（控制台 / logs\*.out.log）
 
 ```
 req#1 done | openai-chat | stop token | prompt 68 | output 1180 | cache 0 (0.0%) |
@@ -95,7 +95,7 @@ pwsh -File .\ms75_eval\run_smoke_kvmem.ps1
 |---|---|---|
 | `capacity \| KV 38,400 tokens, int8, explicit \| pages 600/600 \| runtime 1.79 GiB \| free …` | 设备池大小 / 页数 / 显存占用 | pages 600/600、free 300~1000 MiB |
 | `req#N done \| … prompt X \| output Y \| cache Z (P%)` | 本请求的 token 数与前缀复用率 | 第 2 轮起 cache P 应显著 > 0 |
-| `TTFT / prefill / decode / mtp accepted` | 首 token 时间 / 预填速度 / 解码速度 / 投机接受率 | 短上下文 decode 75~95 tok/s、MTP 90%±5 |
+| `TTFT / prefill / decode / mtp accepted` | 首 token 时间 / 预填速度 / 解码速度 / 投机接受率 | **短 decode/简单内容**：decode 75~95 tok/s、MTP 90%±5；**真实对话**（思考模板/工具调用/中文长文）：MTP 43~60%、decode 45~60 tok/s |
 | `[ALIGN]` / `misaligned` | 对齐自检失败 | **应该 0 行** |
 | `KVMEM_SCORER` / `KVMEM_PROTECT` / `KVMEM_CONF` | ActKV 机制行（需 `--kvmem-verify-transfers`） | 出现即证明对应支柱在跑 |
 

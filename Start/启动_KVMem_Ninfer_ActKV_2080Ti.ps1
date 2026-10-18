@@ -1,4 +1,4 @@
-﻿# =====================================================================
+# =====================================================================
 # [发布版] 本脚本随发布包分发，已做脱敏：
 #   - 引擎 / 日志 / 缓存路径都是相对本脚本（Start\）的路径
 #   - 模型路径留空，需要你填（见下方 $MODEL 一行）
@@ -87,9 +87,9 @@ $MODEL_ID   = "bonsai2-27b-heretic"
 #   【为什么需要】客户端必须用这个名字请求；写错会 404（model_not_found）。
 #   【建议】客户端第一次先 GET /v1/models 拿准确 id。
 $LOG_DIR    = Join-Path $PSScriptRoot "..\logs"
-#   【是什么】日志目录。每次启动生成 server_<时间>.out.log / .err.log。
+#   【是什么】日志目录。每次启动生成 server_<时间>.out.log（stdout+stderr 合并）。
 #   【为什么重要】引擎自己的进度、容量行、每个请求的统计（req#N done：TTFT/prefill/decode/缓存命中）
-#     都在 err.log 里；排查问题第一现场就是它。
+#     都在 out.log 里；排查问题第一现场就是它。
 $CACHE_DIR  = Join-Path $PSScriptRoot "..\Cache"
 #   【是什么】KV/会话磁盘缓存根目录（被下面 $KV_DISK_PATH 使用）。
 #   【效果】E: 是机械盘，改到 NVMe 上会明显加快溢出读写；进程退出时缓存自动清理。
@@ -993,18 +993,21 @@ Write-Host ("  引擎 : " + $EXE)
 Write-Host ("  模型 : " + $MODEL)
 Write-Host ("  参数 : " + ($a -join ' '))
 Write-Host ("  API  : http://$BIND_HOST`:$PORT/v1/chat/completions")
-Write-Host ("  日志 : " + $errLog)
+Write-Host ("  日志 : " + $outLog + "  (stdout + stderr)")
 Write-Host "  按 Ctrl+C 停止服务"
 Write-Host "------------------------------------------------------------" -ForegroundColor DarkGray
 
 # PS 5.1 会把引擎写到 stderr 的每一行都当成脚本错误；若 $ErrorActionPreference='Stop'，
-# 引擎刚打印第一行状态就会终止脚本。这里临时放宽为 Continue，输出仍全部进日志。
+# 引擎刚打印第一行状态就会终止脚本。这里临时放宽为 Continue。
+# 输出策略（v0.1 修复）：stdout+stderr 合并，Tee-Object 同时显示在控制台并写入 out.log；
+#   err.log 不再单独产生（旧日志仍可读）。
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
 try { & cmd /c chcp 65001 > $null } catch { }
 $__eap = $ErrorActionPreference
 $ErrorActionPreference = 'Continue'
 try {
-    & $EXE @a 2> $errLog | Tee-Object -FilePath $outLog
+    # 引擎日志主要走 stderr：合并 stdout+stderr，控制台实时显示 + 同时落盘到 out.log
+    & $EXE @a 2>&1 | Tee-Object -FilePath $outLog
 } finally {
     $ErrorActionPreference = $__eap
 }
