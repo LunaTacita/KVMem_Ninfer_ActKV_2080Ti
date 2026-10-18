@@ -1006,8 +1006,13 @@ try { & cmd /c chcp 65001 > $null } catch { }
 $__eap = $ErrorActionPreference
 $ErrorActionPreference = 'Continue'
 try {
-    # 引擎日志主要走 stderr：合并 stdout+stderr，控制台实时显示 + 同时落盘到 out.log
-    & $EXE @a 2>&1 | Tee-Object -FilePath $outLog
+    # 引擎日志主要走 stderr：合并 stdout+stderr，控制台实时显示 + 同时落盘到 out.log。
+    # 注意：PowerShell 的 `2>&1` 会把 native stderr 包装成 ErrorRecord（终端红字 +
+    # “所在位置/字符/CategoryInfo/NativeCommandError”的假报错，并原样写进日志）——
+    # 这里把 ErrorRecord 还原成纯文本行再输出，终端和日志都只看到引擎原本的日志。
+    & $EXE @a 2>&1 | ForEach-Object {
+        if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.Exception.Message } else { $_ }
+    } | Tee-Object -FilePath $outLog
 } finally {
     $ErrorActionPreference = $__eap
 }
