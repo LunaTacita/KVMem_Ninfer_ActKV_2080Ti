@@ -1,0 +1,23 @@
+# MODELS.txt · 模型包（本目录不含权重）
+
+## 推荐下载
+
+- 社区制品（与本包构建/实测同血统的模型）：<https://huggingface.co/emiltsoi/Ternary-Bonsai-2-27B-Uncensored-Heretic-NInfer>
+- 也可以尝试其他 **NInfer v3 制品**：必须含 `text` 组件；需要投机解码则要含 `mtp`；需要多模态则要含 `vision`。
+- 参考上游项目给出的模型来源：<https://github.com/1314521gjy/ninfer-fusion-kvmem>
+
+## 本包构建与实测使用的制品
+
+| 项 | 值 |
+|---|---|
+| 文件名 | `Ternary-Bonsai-2-27B-Heretic-ninfer.ninfer` |
+| 字节 | 9,520,051,456 |
+| sha256 | `99F94F44BED48892B7C5E1C4DC8349E0DB8B4B44D2BD8AD7CD438CFC181DE2FD` |
+| 格式 | NInfer v3 原生容器；components = text / vision / mtp / dflash2（多模态自包含，不需要外部 mmproj） |
+| 放哪里 | 任意**全 ASCII**目录；把 `Start\启动_KVMem_Ninfer_ActKV_2080Ti.ps1` 的 `$MODEL` 改成该文件的绝对路径 |
+| 校验 | `Get-FileHash -Algorithm SHA256 <文件>` 应等于上表 sha256 |
+
+## 说明
+
+本发布包**不复制权重**（9.5 GB，体积大且许可另计）。
+模型权重许可**另计**，不与本包 Apache 2.0 混同；分发/使用前请确认模型的原始许可。
