@@ -2,63 +2,48 @@
 REM ===========================================================================
 REM  NInfer sm_75 build entry  --  baseline: kvmem/kvmem 0.18 (ninfer backend)
 REM  ASCII only on purpose: a zh-CN locale misreads non-BOM UTF-8 .bat files.
-REM
-REM  PATHS: SRC / BUILD / KVMEMCORE are derived from this script's own location:
-REM      SRC       = the directory holding this .bat (the source tree)
-REM      BUILD     = ..\kvmem_build  next to the source tree
-REM      KVMEMCORE = ..\..\kvmem-0.18\kvmem  (the KVMem core checkout)
-REM  The toolchain defaults are the standard install locations; override any of
-REM  them with an environment variable before running, e.g.
-REM      set "VS=D:\Microsoft Visual Studio\18\Community"
-REM      set "CUDA=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6"
-REM      set "VCPKG_ROOT=D:\vcpkg"
-REM
 REM  Pinned toolchain, why each pin exists:
-REM   - MSVC 14.38.33130 : a newer toolset (14.51) makes CUDA 12.6's cudafe++
-REM     crash (0xC0000005) while probing it.
-REM   - CUDA 12.6        : the toolkit this port was built and measured with.
+REM   - MSVC 14.38.33130 : this host also has 14.51.36231, and CUDA 12.6's
+REM     cudafe++ crashes (0xC0000005) while probing the 14.51 toolset.
+REM   - CUDA 12.6        : the only toolkit installed and the one proven here.
 REM   - VCPKG_ROOT/TRIPLET: vcvars64 of VS 2026 OVERWRITES VCPKG_ROOT with the
 REM     VS-bundled vcpkg, whose x64-windows triplet has no ffmpeg. Both must be
-REM     set AFTER the vcvars call. Without this, configure dies inside CMake's
-REM     FindPackageHandleStandardArgs with a bogus "Invalid character escape
-REM     '\M'" syntax error that hides the real cause.
-REM   - CMAKE_MAKE_PROGRAM : otherwise CMake may pick a ninja found on PATH.
-REM   - NINFER_KVMEM_SOURCE_DIR : the CMake default may resolve to a path that
-REM     does not exist, and CMake then raises FATAL_ERROR.
+REM     set AFTER the vcvars call. Without this, configure dies inside CMake
+REM     4.3's FindPackageHandleStandardArgs with a bogus
+REM     "Invalid character escape '\M'" syntax error that hides the real cause.
+REM   - CMAKE_MAKE_PROGRAM : otherwise CMake may pick D:\Python\...\ninja.exe.
+REM   - NINFER_KVMEM_SOURCE_DIR : the CMake default resolves to E:\AI\kvmem,
+REM     which does not exist, and CMake then raises FATAL_ERROR.
 REM   - CMAKE_CUDA_ARCHITECTURES=75-real : defines NINFER_SM75 for the whole
-REM     tree; "-real" emits sm_75 SASS only (no PTX).
-REM
-REM  deps-prefix fix: cl.exe prints /showIncludes lines as UTF-8 but CMake
-REM  decodes them as ANSI, so rules.ninja never matches and every dep file ends
-REM  up empty; incremental builds then link objects from different header
-REM  generations and the binary crashes at startup with all-green signals.
-REM  VSLANG=1033, PreferredUILang and chcp 65001 were all measured to have NO
-REM  effect, so the one value is rewritten at byte level. CMake's Ninja
-REM  generator writes that file as <build>/CMakeFiles/rules.ninja, not
-REM  <build>/rules.ninja.
-REM  NEVER kill a running build: it corrupts .ninja_deps.
+REM     tree; "-real" emits sm_75 SASS only (no PTX), as the previous stack did.
+REM  N4 deps-prefix: cl.exe prints /showIncludes lines as UTF-8 but CMake decodes
+REM  them as ANSI, so rules.ninja never matches and every dep file ends up empty;
+REM  incremental builds then link objects from different header generations and
+REM  the binary crashes at startup with all-green signals. VSLANG=1033,
+REM  PreferredUILang and chcp 65001 were all measured to have NO effect, so the
+REM  one value is rewritten at byte level. CMake's Ninja generator writes that
+REM  file as <build>/CMakeFiles/rules.ninja, not <build>/rules.ninja.
+REM  NEVER kill a running build: it corrupts .ninja_deps (trap #32 / N32 family).
 REM  Usage:  build_sm75.bat            -> configure + deps-prefix fix
 REM          build_sm75.bat apps       -> build the four product executables
 REM          build_sm75.bat full       -> build everything, -k 0 (keep going)
 REM ===========================================================================
 setlocal
-if not defined VS   set "VS=C:\Program Files\Microsoft Visual Studio\18\Community"
-if not defined CUDA set "CUDA=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6"
-pushd "%~dp0"
-set "SRC=%CD%"
-popd
-if not defined BUILD       set "BUILD=%SRC%\..\kvmem_build"
-if not defined KVMEMCORE   set "KVMEMCORE=%SRC%\..\..\kvmem-0.18\kvmem"
-if not defined VCPKG_ROOT  set "VCPKG_ROOT=%SRC%\..\deps\vcpkg"
+set "VS=D:\Microsoft Visual Studio\18\Community"
 set "VCVARS=%VS%\VC\Auxiliary\Build\vcvars64.bat"
 set "CMAKE=%VS%\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
 set "NINJA=%VS%\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe"
 set "MSVCBIN=%VS%\VC\Tools\MSVC\14.38.33130\bin\Hostx64\x64"
+set "CUDA=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6"
+set "SRC=E:\AI\ninfer-fusion\kvmem_src"
+set "BUILD=E:\AI\ninfer-fusion\kvmem_build"
 set "RULES=%BUILD%\CMakeFiles\rules.ninja"
 set "FIXDEPS=%SRC%\fix_msvc_deps_prefix.ps1"
+set "KVMEMCORE=E:/AI/kvmem-0.18/kvmem"
 
 call "%VCVARS%" -vcvars_ver=14.38.33130 >nul 2>&1
 set "VSLANG=1033"
+set "VCPKG_ROOT=E:\AI\ninfer-fusion\deps\vcpkg"
 set "VCPKG_TARGET_TRIPLET=x64-windows"
 set "CUDACXX=%CUDA%\bin\nvcc.exe"
 set "PATH=%CUDA%\bin;%PATH%"
@@ -69,7 +54,7 @@ REM runs ahead of apps/full, not only after a configure.
 if exist "%RULES%" powershell -NoProfile -ExecutionPolicy Bypass -File "%FIXDEPS%" -RulesPath "%RULES%" > "%BUILD%\fix_deps_prefix.log" 2>&1
 
 REM -k 0 keeps ninja going, so one expensive pass reports EVERY broken target
-REM instead of stopping at the first one.
+REM instead of stopping at the first one (upstream does the same in build_merge.bat).
 if /I "%~1"=="apps" "%CMAKE%" --build "%BUILD%" --target ninfer ninfer-serve ninfer-perplexity ninfer-calibrate --parallel -- -k 0 > "%BUILD%\build_apps.log" 2>&1
 if /I "%~1"=="apps" echo BUILD_APPS_EXIT=%ERRORLEVEL%
 if /I "%~1"=="apps" exit /b %ERRORLEVEL%

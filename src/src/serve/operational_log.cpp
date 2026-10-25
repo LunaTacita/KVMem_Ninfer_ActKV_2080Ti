@@ -283,7 +283,16 @@ OperationalRecord render_request_done(const RequestLogContext& context,
     if (metrics.prefix_reuse_path != ninfer::PrefixReusePath::Root) {
         out << ", " << prefix_reuse_path_name(metrics.prefix_reuse_path);
     }
-    out << ") | TTFT " << product::format_pretty_duration(metrics.ttft_seconds) << " | total "
+    out << ") | TTFT ";
+    if (outcome.completion_tokens > 0) {
+        out << product::format_pretty_duration(metrics.ttft_seconds);
+    } else {
+        // No token was produced (cancelled or failed during prefill). ttft_seconds then degrades
+        // to the prepare time, which reads as "the first token arrived in 238 ms" and hides the
+        // 15-minute prefill. Say that no token was generated instead.
+        out << "n/a (no token)";
+    }
+    out << " | total "
         << product::format_pretty_duration(metrics.total_seconds);
     if (metrics.engine_timing.queue_wait_seconds >= 0.01) {
         out << " | queue "
@@ -390,6 +399,30 @@ OperationalRecord render_throughput(const ThroughputReport& report) {
         report.interval_seconds > 0.0
             ? static_cast<double>(report.committed_decode_tokens) / report.interval_seconds
             : 0.0;
+    // Long prefills and KVMem tiering are invisible in this line otherwise: a 222K-token prefill
+    // reports no completed prefill token for many 5 s windows (a chunk takes longer than the
+    // window) and looks like an idle server. Publish the prefill unit progress, where the host
+    // time went, and the KV history traffic since the previous report so the line answers
+    // "is it still working, and on what".
+    const auto delta = [](std::uint64_t now, std::uint64_t before) {
+        return now > before ? now - before : std::uint64_t{0};
+    };
+    const std::uint64_t prefill_units =
+        delta(report.current.host_work.prefill_units, report.previous.host_work.prefill_units);
+    const std::uint64_t prefill_host_ns = delta(report.current.host_work.prefill_host_ns,
+                                                report.previous.host_work.prefill_host_ns);
+    const std::uint64_t prefill_wait_ns = delta(report.current.host_work.prefill_device_wait_ns,
+                                                report.previous.host_work.prefill_device_wait_ns);
+    const std::uint64_t history_swaps =
+        delta(report.current.kvmem.history_swaps, report.previous.kvmem.history_swaps);
+    const std::uint64_t history_restored =
+        delta(report.current.kvmem.history_restored_bytes,
+              report.previous.kvmem.history_restored_bytes);
+    const std::uint64_t history_spilled = delta(report.current.kvmem.history_spilled_bytes,
+                                                report.previous.kvmem.history_spilled_bytes);
+    const auto mib = [](std::uint64_t bytes) {
+        return static_cast<double>(bytes) / (1024.0 * 1024.0);
+    };
     std::ostringstream out;
     out << "throughput | " << product::format_pretty_duration(report.interval_seconds);
     if (report.computed_prefill_tokens != 0) {
@@ -399,6 +432,29 @@ OperationalRecord render_throughput(const ThroughputReport& report) {
     if (report.committed_decode_tokens != 0) {
         out << " | decode " << product::format_pretty_rate(decode_rate, "tok") << " ("
             << product::format_pretty_count(report.committed_decode_tokens) << " tok)";
+    }
+    if (prefill_units != 0) {
+        out << " | prefill-units " << product::format_pretty_count(prefill_units);
+        if (prefill_host_ns != 0 || prefill_wait_ns != 0) {
+            out << " (host " << product::format_pretty_duration(static_cast<double>(prefill_host_ns) * 1.0e-9)
+                << ", wait "
+                << product::format_pretty_duration(static_cast<double>(prefill_wait_ns) * 1.0e-9)
+                << ')';
+        }
+    }
+    if (history_restored != 0 || history_spilled != 0 || history_swaps != 0) {
+        out << " | kv-history";
+        if (history_restored != 0) {
+            out << " restore " << std::fixed << std::setprecision(1) << mib(history_restored)
+                << " MiB";
+        }
+        if (history_spilled != 0) {
+            out << " spill " << std::fixed << std::setprecision(1) << mib(history_spilled)
+                << " MiB";
+        }
+        if (history_swaps != 0) {
+            out << " swaps " << product::format_pretty_count(history_swaps);
+        }
     }
     out << " | running " << report.current.running_requests;
     if (report.current.prefilling_requests != 0 || report.current.decode_ready_requests != 0) {

@@ -201,20 +201,8 @@ def validate(gguf: GGUFFile, config: dict) -> None:
     """Refuse any GGUF that is not the Flash-Next text model this config describes."""
 
     for key, expected in EXPECTED_HEADER.items():
-        actual = gguf.kv.get(key)
-        if key == "qwen4exp.block_count":
-            # LOCAL ADAPTATION (2026-10-17). The Q8_0-MTP release carries its MTP block as the
-            # tensors blk.48.* and therefore reports block_count = 49 = LAYERS text blocks plus
-            # that one MTP block. The rest of this recipe already excludes blk.{LAYERS}.* from the
-            # tensor set (see expected_tensors below) and the baseline reads none of it, so accept
-            # exactly that one extra block here and keep every other header key exact.
-            if actual not in (expected, expected + 1):
-                raise ValueError(
-                    f"{gguf.path}: {key} = {actual!r}, expected {expected!r} or {expected + 1!r}"
-                )
-            continue
-        if actual != expected:
-            raise ValueError(f"{gguf.path}: {key} = {actual!r}, expected {expected!r}")
+        if gguf.kv.get(key) != expected:
+            raise ValueError(f"{gguf.path}: {key} = {gguf.kv.get(key)!r}, expected {expected!r}")
     if gguf.kv.get("qwen4exp.expert_count") != config["num_experts"]:
         raise ValueError(
             f"{gguf.path}: {gguf.kv.get('qwen4exp.expert_count')} experts per layer, the model config "
@@ -538,25 +526,11 @@ def ngram_source(gguf: GGUFFile, rows_count: int) -> LogicalSource:
 def table_digest(gguf: GGUFFile) -> str:
     """SHA-256 of the n-gram table's bytes, which the artifact stores unchanged, row for row."""
 
-    info = gguf.info(NGRAM_TENSOR)
-    size = info.nbytes
-    # LOCAL ADAPTATION (2026-10-16). Read the shard with plain file IO instead of letting
-    # GGUFFile.tensor_bytes() slice its numpy memmap. Measured on this host over the same bytes:
-    # 8 x 256 MiB took 11.777 s through the memmap against 4.077 s through pread, and both paths
-    # produced the identical digest. A 28.8 GB table therefore costs about 57 s here instead of
-    # about 165 s, and it no longer keeps the whole table resident through a mapping while the
-    # rest of the conversion is also holding a 42 GB model shard open.
-    shard = gguf._tensor_shard[NGRAM_TENSOR]
-    base = gguf._data_offsets[shard] + info.offset
+    size = gguf.info(NGRAM_TENSOR).nbytes
     digest = hashlib.sha256()
     step = 1 << 28
-    with open(gguf.paths[shard], "rb") as handle:
-        handle.seek(base)
-        remaining = size
-        while remaining > 0:
-            chunk = min(step, remaining)
-            digest.update(handle.read(chunk))
-            remaining -= chunk
+    for begin in range(0, size, step):
+        digest.update(gguf.tensor_bytes(NGRAM_TENSOR, begin, min(begin + step, size)))
     return digest.hexdigest()
 
 

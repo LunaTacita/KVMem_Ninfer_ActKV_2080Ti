@@ -697,6 +697,23 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             executable = &install_graph_profile(family, profile, "MTP batch");
             envelopes  = mtp_causal_attention_envelopes(profile.max_execution_frontier,
                                                         verify_window, draft_window, attention_capacity);
+            // Capture maps every logical page of the profile's envelope (publish_repeated) so a
+            // replay can address any key up to max_frontier + verify_window + 1. Replay must keep
+            // that invariant: mapping only to the live frontier leaves the envelope tail
+            // unmapped, and the attention kernel then reads an unmapped execution-table entry
+            // (cudaErrorMisalignedAddress, first reported by whichever later call synchronises).
+            const auto envelope_end =
+                std::min(attention_capacity, profile.max_execution_frontier + verify_window + 1U);
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                SequenceState& graphics_sequence = active_sequence(lanes[row]);
+                if (!graphics_sequence.kv) { continue; }
+                text_kv_addresses->ensure_mapped_to_tokens(graphics_sequence.kv->text, envelope_end,
+                                                           compute_streams);
+                if (graphics_sequence.kv->backend) {
+                    backend_kv_addresses->ensure_mapped_to_tokens(*graphics_sequence.kv->backend,
+                                                                  envelope_end, compute_streams);
+                }
+            }
         }
 
         bool logprobs = false;
@@ -746,8 +763,24 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                     {mtp_host_ingress->current_drafts.data() + row * verify_window, extent},
                     device.stream);
             }
-            ensure_sequence_kv_mapped(sequence, frontier + extent + 1,
-                                      std::min(capacity, frontier + extent + draft_window));
+            // The attention envelopes are built from the configured verify window, not from this
+            // round's extent: a round that proposes fewer drafts than the window still launches a
+            // kernel whose envelope spans max_frontier + verify_window + 1 keys. Mapping only to
+            // `extent` leaves the tail pages of that envelope unmapped, and the attention kernel
+            // then walks into an unmapped execution-table entry, which the driver reports as
+            // cudaErrorMisalignedAddress on whichever later call synchronises first. The envelope
+            // must still stop at the KVMem device window: the page entitlement is exactly the
+            // window's page count, and a single token past it fails the coverage contract.
+            const auto window_end =
+                sequence.window.removed_tokens > capacity - kvmem_window_tokens
+                    ? capacity
+                    : sequence.window.removed_tokens + kvmem_window_tokens;
+            const auto mapped_main = std::min(std::min(capacity, frontier + verify_window + 1U),
+                                              window_end);
+            const auto mapped_backend =
+                std::min(std::min(capacity, frontier + verify_window + draft_window + 1U),
+                         window_end);
+            ensure_sequence_kv_mapped(sequence, mapped_main, mapped_backend);
         }
 
         arm_logprobs(logprobs);

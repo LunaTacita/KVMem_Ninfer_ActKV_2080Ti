@@ -580,6 +580,9 @@ std::string serve_usage_text(const char* argv0) {
            "                                (default 384)\n"
            "  --max-pending-requests N      requests waiting for admission (default 16)\n"
            "  --pending-timeout-ms N        preparation-plus-admission wait (default 600000)\n"
+           "  --webui-request-timeout-ms N  the built-in WebUI's per-response fetch deadline,\n"
+           "                                applied by the page itself from /props (default\n"
+           "                                3600000 = 1 hour; 0 = no client-side deadline)\n"
            "  --recover-invariant-failures  on a broken internal invariant, fail the active\n"
            "                                requests and keep serving the queue instead of\n"
            "                                failing the engine\n"
@@ -939,6 +942,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         if (arg == "--pending-timeout-ms") {
             options.pending_timeout_ms = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--pending-timeout-ms"), "pending-timeout-ms"));
+            continue;
+        }
+        if (arg == "--webui-request-timeout-ms") {
+            options.webui_request_timeout_ms = static_cast<std::uint32_t>(parse_nonnegative_int(
+                require_value("--webui-request-timeout-ms"), "webui-request-timeout-ms"));
             continue;
         }
         if (arg == "--prefill-chunk") {
@@ -2058,7 +2066,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
 
         // KVMem admission is checked one clause at a time, so a rejected launch names the single
         // option that failed and the value this machine accepts instead. The combined test used
-        // to print ten conditions in one line, which hid the actual cause.
+        // to print ten conditions in one line, which hid the actual cause (N47, DFlash2).
         const bool kvmem_dtype_ok =
             options.kv_cache == KvCacheStorage::BFloat16 ||
             options.kv_cache == KvCacheStorage::Int8Group64 ||
@@ -2286,7 +2294,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 "derives the device pool itself as (B+R) x max-concurrency = " +
                 std::to_string(static_cast<std::uint64_t>(window) * options.max_concurrency) +
                 " tokens, which is the only value this machine accepts here. Leave --kv-capacity "
-                "unset in every form.");
+                "unset in every form (N47).");
         }
         if (window * options.max_concurrency > std::numeric_limits<std::uint32_t>::max()) {
             throw std::invalid_argument("KVMem global device capacity exceeds uint32");

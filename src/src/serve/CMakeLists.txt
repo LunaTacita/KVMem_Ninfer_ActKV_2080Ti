@@ -1,5 +1,6 @@
 add_library(ninfer_serve STATIC
   http_transport.cpp
+  stream_sessions.cpp
   console_log.cpp
   request_validation.cpp
   structured_output.cpp

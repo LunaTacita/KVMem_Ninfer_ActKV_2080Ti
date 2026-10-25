@@ -1,7 +1,6 @@
 #include "ninfer/engine.h"
 #include "kvmem_test_options.h"
 #include <atomic>
-#include <cstdlib>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -56,20 +55,8 @@ int main(int argc, char** argv) {
                                     : ninfer::KvCacheStorage::Int8Group64;
         if (argc == 5) options.use_cuda_graph = ninfer::test::kvmem_test_graph(argv[4]);
         options.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(512);
-        // The fixture's own Host budget is an INT8-equivalent 230 MiB. The Engine admits
-        // --max-context 16384 only if the retained Host + SSD budget covers the native payload:
-        // at 35904 bytes per token in INT8 that window needs 561 MiB, so the run is refused before
-        // any session starts. NINFER_SESSION_TEST_HOST_MIB lets a registration ask for a budget the
-        // admission check accepts while keeping Host small enough that the four archives below still
-        // evict; the source keeps 230 MiB as the default for hand runs. The fixture needs both
-        // properties at once, so the accepted value is measured on this host, not assumed.
-        std::uint64_t host_bytes =
-            ninfer::test::kvmem_test_host_bytes(230ULL << 20, options.kv_cache);
-        if (const auto* overridden = std::getenv("NINFER_SESSION_TEST_HOST_MIB")) {
-            host_bytes = std::stoull(overridden) << 20;
-            require(host_bytes > 0, "NINFER_SESSION_TEST_HOST_MIB must be a positive number of MiB");
-        }
-        options.kvmem = {.selected_tokens = 384, .reserve_tokens = 128, .host_bytes = host_bytes,
+        options.kvmem = {.selected_tokens = 384, .reserve_tokens = 128,
+            .host_bytes = ninfer::test::kvmem_test_host_bytes(230ULL << 20, options.kv_cache),
             .retained_sessions = 3, .verify_transfers = true};
         options.context_cache.enabled = false;
         const auto drafts = static_cast<std::uint32_t>(std::stoul(argv[2]));

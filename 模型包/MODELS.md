@@ -1,8 +1,8 @@
-# MODELS.txt · 模型包（本目录不含权重）
+# MODELS.md · 模型包（本目录不含权重）
 
 ## 推荐下载
 
-- 社区制品（与本包构建/实测同血统的模型）：<https://huggingface.co/emiltsoi/Ternary-Bonsai-2-27B-Uncensored-Heretic-NInfer>
+- 社区制品（与本包构建/实测使用同一模型来源）：<https://huggingface.co/emiltsoi/Ternary-Bonsai-2-27B-Uncensored-Heretic-NInfer>
 - 也可以尝试其他 **NInfer v3 制品**：必须含 `text` 组件；需要投机解码则要含 `mtp`；需要多模态则要含 `vision`。
 - 参考上游项目给出的模型来源：<https://github.com/1314521gjy/ninfer-fusion-kvmem>
 

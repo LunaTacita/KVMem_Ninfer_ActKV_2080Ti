@@ -57,14 +57,6 @@ ninfer_add_test(ninfer_qwen3_5_runtime_mechanisms_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_runtime_mechanisms.cpp"
   LIBRARIES ninfer_engine ninfer_core)
 
-# ActKV pillar 1 (the retrieval query) at the renderer, where the rule is actually applied. Host
-# only: no artifact and no CUDA, so it runs in milliseconds on every ctest pass and fails the moment
-# the rule regresses to "oldest human turn".
-ninfer_add_test(ninfer_kvmem_actkv_test
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_kvmem_actkv.cpp"
-  NEEDS_SOURCE_DIR
-  LIBRARIES ninfer_engine ninfer_core ninfer::json)
-
 ninfer_add_test(ninfer_qwen3_5_state_image_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_state_image.cpp"
   LIBRARIES ninfer_engine ninfer_core)

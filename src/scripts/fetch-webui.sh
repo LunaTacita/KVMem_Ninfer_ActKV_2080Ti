@@ -8,7 +8,7 @@ set -euo pipefail
 #
 # tag defaults to the release below; dir defaults to third_party/webui/<tag> (ignored by git).
 
-tag=${1:-b11165}
+tag=${1:-b11796}
 root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 dir=${2:-$root/third_party/webui/$tag}
 url="https://github.com/ggml-org/llama.cpp/releases/download/$tag/llama-$tag-ui.tar.gz"

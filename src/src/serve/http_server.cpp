@@ -665,6 +665,21 @@ void HttpServer::register_routes() {
                   [this](const httplib::Request& req, httplib::Response& res) {
                       handle_chat_completions(req, res);
                   });
+    // Resumable chat streams (the built-in WebUI's X-Conversation-Id opt-in): GET replays a
+    // session's bytes from an offset, POST lists the sessions a reloaded page may continue, DELETE
+    // releases and stops one. Registered before the WebUI catch-all like every other API route.
+    server_.Get(api_route_pattern("/stream"),
+                [this](const httplib::Request& req, httplib::Response& res) {
+                    handle_stream_replay(req, res);
+                });
+    register_post(api_route_pattern("/streams/lookup"),
+                  [this](const httplib::Request& req, httplib::Response& res) {
+                      handle_stream_lookup(req, res);
+                  });
+    register_delete(api_route_pattern("/stream"),
+                    [this](const httplib::Request& req, httplib::Response& res) {
+                        handle_stream_cancel(req, res);
+                    });
     register_post(api_route_pattern("/completions"),
                   [this](const httplib::Request& req, httplib::Response& res) {
                       handle_text_completion(req, res, TextCompletionDialect::OpenAI);
@@ -771,6 +786,86 @@ void HttpServer::handle_webui(const httplib::Request& req, httplib::Response& re
     }
     res.set_content(reinterpret_cast<const char*>(asset->bytes.data()), asset->bytes.size(),
                     std::string(asset->content_type));
+}
+
+// GET /v1/stream?conv_id=<id>&from=<byte offset>: replay a resumable chat stream. The body repeats
+// the same SSE bytes the POST produced (plus comment heartbeats while quiet), so the WebUI parses it
+// exactly like the original stream and continues from where it stopped.
+void HttpServer::handle_stream_replay(const httplib::Request& req, httplib::Response& res) {
+    const auto send_error = [&res](int status, const char* message) {
+        res.status = status;
+        res.set_content(std::string("{\"error\":{\"type\":\"invalid_request_error\",\"message\":\"") +
+                            message + "\"}}",
+                        "application/json");
+    };
+    const std::string conv_id = req.get_param_value("conv_id");
+    if (conv_id.empty()) {
+        send_error(400, "missing conv_id");
+        return;
+    }
+    std::size_t from = 0;
+    if (req.has_param("from")) {
+        const std::string raw = req.get_param_value("from");
+        try {
+            from = static_cast<std::size_t>(std::stoull(raw));
+        } catch (const std::exception&) {
+            send_error(400, "from must be a byte offset");
+            return;
+        }
+    }
+    std::shared_ptr<StreamSession> session = stream_sessions_.find(conv_id);
+    if (!session) {
+        send_error(404, "no live stream session");
+        return;
+    }
+    prepare_sse_response(res);
+    res.set_chunked_content_provider(
+        "text/event-stream",
+        [session, from](std::size_t, httplib::DataSink& sink) -> bool {
+            std::size_t cursor = from;
+            const bool complete = session->pump(
+                [&sink](std::string_view chunk) { return sink.write(chunk.data(), chunk.size()); },
+                cursor);
+            if (complete) { sink.done(); }
+            return complete;
+        },
+        [](bool) {});
+}
+
+// POST /v1/streams/lookup {conversation_ids: [...]}: the sessions a reloaded page can continue.
+void HttpServer::handle_stream_lookup(const httplib::Request& req, httplib::Response& res) {
+    const RequestJson body = parse_json_body(req);
+    std::vector<std::string> ids;
+    if (const auto it = body.find("conversation_ids"); it != body.end() && it->is_array()) {
+        for (const auto& value : *it) {
+            if (value.is_string()) { ids.push_back(value.get<std::string>()); }
+        }
+    }
+    nlohmann::json sessions = nlohmann::json::array();
+    for (const StreamSessionInfo& info : stream_sessions_.lookup(ids)) {
+        sessions.push_back({{"conversation_id", info.conv_id},
+                            {"model", info.model},
+                            {"is_done", info.done},
+                            {"truncated", info.truncated},
+                            {"total_bytes", info.total_bytes},
+                            {"started_at", info.started_at},
+                            {"completed_at", info.completed_at}});
+    }
+    res.set_content(sessions.dump(), "application/json");
+}
+
+// DELETE /v1/stream?conv_id=<id>: release the replay buffer and stop a still-running generation.
+void HttpServer::handle_stream_cancel(const httplib::Request& req, httplib::Response& res) {
+    const std::string conv_id = req.get_param_value("conv_id");
+    if (conv_id.empty()) {
+        res.status = 400;
+        res.set_content(
+            R"({"error":{"type":"invalid_request_error","message":"missing conv_id"}})",
+            "application/json");
+        return;
+    }
+    const bool released = stream_sessions_.erase(conv_id);
+    res.set_content((nlohmann::json{{"deleted", released}}).dump(), "application/json");
 }
 
 // llama.cpp-shaped slot listing: one entry per private context-cache catalog cell. A cell an
@@ -1049,6 +1144,9 @@ void HttpServer::handle_props(const httplib::Request& req, httplib::Response& re
         {"cors_proxy_enabled", options_.webui_mcp_proxy},
     };
     props["backend"] = "ninfer";
+    // The built-in WebUI is a static page: it cannot see the command line, so the per-response
+    // fetch deadline is published here and the page applies it (0 = no client-side deadline).
+    props["webui"] = {{"request_timeout_ms", options_.webui_request_timeout_ms}};
     const auto& execution = service.engine_options();
     props["execution"] = {{"mode", execution.devices.size() > 1 ? "layer" : "single"},
         {"devices", execution.devices.empty() ? std::vector<int>{execution.device} : execution.devices},

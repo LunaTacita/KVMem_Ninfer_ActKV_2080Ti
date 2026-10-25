@@ -3,6 +3,7 @@
 #include "serve/http_transport.h"
 #include "serve/openai_chat.h"
 #include "serve/openai_common.h"
+#include "serve/stream_sessions.h"
 
 #include <atomic>
 #include <cstddef>
@@ -38,6 +39,24 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
     }
     GenerationService* const service = &lease.service();
 
+    // Resumable stream opt-in: the built-in WebUI tags a streaming POST with the identity it will
+    // replay under (X-Conversation-Id). The session keeps producing after this connection drops;
+    // untagged requests keep the old behaviour, where a disconnect cancels generation.
+    std::string conv_id;
+    std::shared_ptr<StreamSession> session;
+    if (request.stream) {
+        conv_id = req.get_header_value("X-Conversation-Id");
+        if (!conv_id.empty() && conv_id.size() <= 240) {
+            session = stream_sessions_.open(conv_id, request.model);
+        }
+    }
+    // Cancellation for the preparation phase: a tagged stream must survive the client going away
+    // (a reload during a slow model load or prompt rendering has to be resumable), while an
+    // untagged request keeps the client's disconnect as its cancel signal.
+    const std::function<bool()> prepare_cancelled =
+        session ? std::function<bool()>([session] { return session->should_cancel(); })
+                : std::function<bool()>([&req] { return client_disconnected(req); });
+
     const std::uint64_t req_id = ++request_seq_;
     const RequestLogMetadata metadata{.model                  = request.model,
                                       .stream                 = request.stream,
@@ -52,14 +71,16 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         prepared = service->prepare(request.generation,
                                     request.stream ? GenerationConsumerMode::Streaming
                                                    : GenerationConsumerMode::Aggregate,
-                                    observation, [&req] { return client_disconnected(req); });
+                                    observation, prepare_cancelled);
         prepared.model_hold = std::make_shared<ModelRegistry::Lease>(std::move(lease));
     } catch (const ApiException& exception) {
+        if (session) { stream_sessions_.erase(conv_id); }
         record_request_rejected(make_request_rejection_log_context(
             req_id, "openai_chat_completions", request.generation, metadata, exception.error()));
         write_openai_error(res, exception.error());
         return;
     } catch (const std::exception& exception) {
+        if (session) { stream_sessions_.erase(conv_id); }
         ApiError error;
         error.status  = 500;
         error.type    = "internal_error";
@@ -124,34 +145,45 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         prepare_sse_response(res);
         res.set_chunked_content_provider(
             "text/event-stream",
-            [this, service, stream, encoder, lifecycle, return_progress,
+            [this, service, stream, encoder, lifecycle, session, conv_id, return_progress,
              timings_per_token](std::size_t, httplib::DataSink& sink) -> bool {
                 if (stream->started.exchange(true, std::memory_order_acq_rel)) {
                     sink.done();
                     return true;
                 }
                 SseTransport transport(sink, stream->cancelled);
+                bool client_gone = false;
+                // Every SSE payload also lands in the replay buffer, so a later GET /v1/stream can
+                // repeat exactly these bytes. A dead socket stops the socket writes but not the
+                // generation: that is what makes a reload resume instead of restart.
+                const auto emit_text = [&](std::string_view payload) {
+                    if (session) { session->append(payload); }
+                    if (client_gone) { return; }
+                    try {
+                        transport.write(payload);
+                        // This connection is a live consumer while it accepts bytes; the idle
+                        // timeout only fires for an abandoned generation, not a slow prefill.
+                        if (session) { session->touch_consumer(); }
+                    } catch (const ClientDisconnected&) {
+                        client_gone = true;
+                    }
+                };
+                const auto emit_list = [&](const std::vector<std::string>& items) {
+                    for (const std::string& item : items) { emit_text(item); }
+                };
                 const auto send_error = [&](const ApiError& error) {
                     try {
-                        render_and_write(transport, [&] { return sse_error_event(error); });
+                        emit_text(sse_error_event(error));
                         sink.done();
                         return true;
-                    } catch (const ClientDisconnected&) {
-                        lifecycle->response_failure(
-                            make_client_disconnected_failure(RequestFailurePhase::Transport));
-                        return false;
-                    } catch (const ResponseRenderFailure& exception) {
-                        lifecycle->response_failure(make_internal_request_failure(
-                            RequestFailurePhase::ResponseRender, exception.what()));
+                    } catch (const std::exception&) {
                         return false;
                     }
                 };
                 try {
-                    render_and_write(transport, [&] { return encoder->start(); });
+                    emit_text(encoder->start());
                 } catch (const ClientDisconnected&) {
-                    lifecycle->failure(
-                        make_client_disconnected_failure(RequestFailurePhase::Transport));
-                    return false;
+                    client_gone = true;
                 } catch (const ResponseRenderFailure& exception) {
                     lifecycle->failure(make_internal_request_failure(
                         RequestFailurePhase::ResponseRender, exception.what()));
@@ -159,6 +191,9 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                     error.status  = 500;
                     error.type    = "internal_error";
                     error.message = exception.what();
+                    if (session) {
+                        stream_sessions_.erase(conv_id);
+                    }
                     return send_error(error);
                 }
 
@@ -167,15 +202,11 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                     StreamSink output;
                     output.on_start = [&](const ninfer::GenerationStart& start) {
                         encoder->note_start(start);
-                        if (return_progress) {
-                            render_and_write(transport,
-                                             [&] { return encoder->initial_prompt_progress(); });
-                        }
+                        if (return_progress) { emit_text(encoder->initial_prompt_progress()); }
                     };
                     if (return_progress) {
                         output.on_progress = [&](const ninfer::PromptProgress& progress) {
-                            render_and_write(transport,
-                                             [&] { return encoder->prompt_progress(progress); });
+                            emit_text(encoder->prompt_progress(progress));
                         };
                     }
                     if (timings_per_token) {
@@ -185,20 +216,33 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                     }
                     output.on_content = [&](const std::string& text,
                                             std::span<const ninfer::TokenLogprob> logprobs) {
-                        render_and_write(transport,
-                                         [&] { return encoder->content_delta(text, logprobs); });
+                        emit_text(encoder->content_delta(text, logprobs));
                     };
                     output.on_reasoning = [&](const std::string& text) {
-                        render_and_write(transport, [&] { return encoder->reasoning_delta(text); });
+                        emit_text(encoder->reasoning_delta(text));
                     };
-                    output.is_cancelled = [&] { return transport.poll(); };
+                    if (session) {
+                        output.is_cancelled = [session, &client_gone] {
+                            // While this POST connection accepts bytes it counts as the session's
+                            // consumer, so a long prefill is never mistaken for an abandoned one.
+                            // After a drop the replay route refreshes this when the page returns.
+                            if (!client_gone) { session->touch_consumer(); }
+                            return session->should_cancel();
+                        };
+                    } else {
+                        output.is_cancelled = [&transport] { return transport.poll(); };
+                    }
 
                     outcome = service->run(stream->prepared, &output);
                 } catch (const ClientDisconnected&) {
+                    // Only reachable without a session (a tagged stream swallows disconnects in
+                    // emit_text); the untagged path keeps the old cancel-on-disconnect semantics.
+                    if (session) { session->finish(); }
                     lifecycle->failure(
                         make_client_disconnected_failure(RequestFailurePhase::Transport));
                     return false;
                 } catch (const ResponseRenderFailure& exception) {
+                    if (session) { session->finish(); }
                     lifecycle->failure(make_internal_request_failure(
                         RequestFailurePhase::ResponseRender, exception.what()));
                     ApiError error;
@@ -207,9 +251,11 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                     error.message = exception.what();
                     return send_error(error);
                 } catch (const ApiException& exception) {
+                    if (session) { session->finish(); }
                     lifecycle->failure(make_generation_request_failure(exception.error()));
                     return send_error(exception.error());
                 } catch (const std::exception& exception) {
+                    if (session) { session->finish(); }
                     lifecycle->failure(make_internal_request_failure(
                         RequestFailurePhase::Generation, exception.what()));
                     ApiError error;
@@ -228,6 +274,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                         terminal.insert(terminal.begin(), std::move(comment));
                     }
                 } catch (const std::exception& exception) {
+                    if (session) { session->finish(); }
                     lifecycle->response_failure(make_internal_request_failure(
                         RequestFailurePhase::ResponseRender, exception.what()));
                     ApiError error;
@@ -236,17 +283,16 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                     error.message = exception.what();
                     return send_error(error);
                 }
-                try {
-                    transport.write(terminal);
-                    sink.done();
-                    return true;
-                } catch (const ClientDisconnected&) {
-                    lifecycle->response_failure(
-                        make_client_disconnected_failure(RequestFailurePhase::Transport));
-                    return false;
-                }
+                emit_list(terminal);
+                if (session) { session->finish(); }
+                sink.done();
+                return true;
             },
-            [stream, lifecycle](bool successful) {
+            [stream, session, lifecycle](bool successful) {
+                // Without a session the connection owns the generation: closing it cancels, as
+                // before. With one, the session owns the remaining output and a replay route may
+                // still attach, so the release of this connection must not cancel anything.
+                if (session) { return; }
                 stream->cancelled.store(true, std::memory_order_release);
                 if (!successful || !stream->started.load(std::memory_order_acquire)) {
                     lifecycle->failure(
@@ -254,6 +300,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                 }
             });
     } catch (const std::exception& exception) {
+        if (session) { stream_sessions_.erase(conv_id); }
         lifecycle->failure(
             make_internal_request_failure(RequestFailurePhase::ResponseRender, exception.what()));
         ApiError error;

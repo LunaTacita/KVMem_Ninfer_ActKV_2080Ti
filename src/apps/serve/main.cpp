@@ -150,9 +150,16 @@ private:
                      error.what();
         } catch (...) { detail = "terminate called after throwing a non-std exception"; }
     }
-    std::fprintf(stderr, "ninfer-serve: %s\n", detail.c_str());
+    // A CUDA illegal access or a broken internal invariant leaves this process unable to serve
+    // another request, so it must end. End it with a plain non-zero status and one visible
+    // diagnostic instead of abort(): abort() surfaces on Windows as a WER crash report
+    // (0xc0000409 in ucrtbase) that hides the real message from the operator.
+    std::fprintf(stderr,
+                 "ninfer-serve: FATAL: %s\n"
+                 "ninfer-serve: the engine has stopped; restart the service to continue serving.\n",
+                 detail.c_str());
     std::fflush(stderr);
-    std::abort();
+    std::_Exit(EXIT_FAILURE);
 }
 
 #ifdef _WIN32

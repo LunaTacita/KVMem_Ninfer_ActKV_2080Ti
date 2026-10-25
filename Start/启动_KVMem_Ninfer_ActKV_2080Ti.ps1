@@ -1,13 +1,5 @@
 ﻿# =====================================================================
-# [发布版] 本脚本随发布包分发，已做脱敏：
-#   - 引擎 / 日志 / 缓存路径都是相对本脚本（Start\）的路径
-#   - 模型路径留空，需要你填（见下方 $MODEL 一行）
-#   - 端口默认 8080（llama.cpp 默认），按需修改
-# 首次使用：把 $MODEL 改成你的 .ninfer 模型绝对路径（全 ASCII），保存，
-# 然后执行：powershell -ExecutionPolicy Bypass -File .\启动_KVMem_Ninfer_ActKV_2080Ti.ps1
-# =====================================================================
-# =====================================================================
-# KVMem_Ninfer_ActKV_2080Ti v0.1 启动脚本
+# KVMem_Ninfer_ActKV_2080Ti v0.1.1 启动脚本
 # =====================================================================
 # =====================================================================
 # 【30 秒上手速查】
@@ -35,7 +27,7 @@
 #   1) KVMem  —— 让 27B 模型在 11GB 卡上用 1M 逻辑上下文：
 #                历史放主机内存/SSD，显存里只放"当前要看的窗口"。
 #   2) MTP    —— 投机解码：模型自带小头先猜 2 个 token，主模型一次验证；
-#                实测 decode 从 44.9 提到 80.3 tok/s。
+#                实测 decode 明显提升（关 MTP 约 51–52 tok/s，开 MTP 约 80 tok/s；见指南 §1）。
 #   3) int8 KV—— 每 token KV 约 30 KiB（bf16 是 68 KiB），省一半显存且 PPL 只差 0.00072。
 #
 # 【怎么用】
@@ -53,7 +45,10 @@
 #   http://localhost:8080/v1/chat/completions   (OpenAI 兼容)
 #   http://localhost:8080/v1/models            (取 model 名，必须是这里的 id)
 #   http://localhost:8080/v1/load              (容量/KVMem 状态自证)
-#   http://localhost:8080/health
+#   http://localhost:8080/props                (服务端配置自述，只读：模型别名/上下文/采样默认值/
+#                                               kvmem 能力/execution/webui 超时等；内置 WebUI 启动时
+#                                               用它读取 --webui-request-timeout-ms 的值)
+#   http://localhost:8080/health                (就绪状态)
 #
 # ★★ 三条铁律（违反会直接起不来或静默答错）★★
 #   1. KVMem 模式下【绝对不要传 --kv-capacity】（任何形式，含 auto）。
@@ -74,30 +69,31 @@
 # ============================================================
 # 一、基础路径与模型
 # ============================================================
-$EXE        = Join-Path $PSScriptRoot "..\engine\ninfer-serve.exe"
+$EXE        = (Join-Path $PSScriptRoot '..\engine\ninfer-serve.exe')
 #   【是什么】引擎可执行文件路径。
 #   【什么时候改】几乎不用改。路径错会直接启动失败（报 CreateFileW / 找不到文件）。
-$MODEL      = ""   # ★ 必填：你的 .ninfer 模型绝对路径（解压路径必须全 ASCII）
+$MODEL      = (Join-Path $PSScriptRoot '..\model\Ternary-Bonsai-2-27B-Heretic-ninfer.ninfer')
 #   【是什么】主模型制品：去审查的 Bonsai（Ternary-Bonsai-2-27B），NInfer v3 容器，自含 text/vision/mtp/dflash2。
 #   【为什么是 .ninfer 不是 .gguf】这套引擎只认 NInfer v3 容器；旧格式/gguf 加载不了。
 #   【路径要求】解压/模型路径必须全 ASCII（原生 exe 读不了中文路径）。
-#   【加载耗时】9.5GB 权重，NVMe 上约 5~9 秒，机械盘冷缓存可能 40 秒（日志会停在 loading，不是死锁）。
-$MODEL_ID   = "bonsai2-27b-heretic"
+#   【加载耗时】9.5GB 权重，NVMe 上约 5~9 秒，机械盘冷缓存可能 40 秒（日志会停在 loading）。
+#   【布局】以上路径默认相对本脚本（发布包布局：<包根>\engine|model|logs|Cache）；模型也可改成你的绝对路径。
+$MODEL_ID   = "Qwen3.8-27B-Uncensored"
 #   【是什么】对外暴露的模型名（API 请求里 model 字段的值）。
 #   【为什么需要】客户端必须用这个名字请求；写错会 404（model_not_found）。
 #   【建议】客户端第一次先 GET /v1/models 拿准确 id。
-$LOG_DIR    = Join-Path $PSScriptRoot "..\logs"
-#   【是什么】日志目录。每次启动生成 server_<时间>.out.log（stdout+stderr 合并）。
+$LOG_DIR    = (Join-Path $PSScriptRoot '..\logs')
+#   【是什么】日志目录。每次启动生成 server_<时间>.out.log / .err.log。
 #   【为什么重要】引擎自己的进度、容量行、每个请求的统计（req#N done：TTFT/prefill/decode/缓存命中）
-#     都在 out.log 里；排查问题第一现场就是它。
-$CACHE_DIR  = Join-Path $PSScriptRoot "..\Cache"
+#     都在 err.log 里；排查问题第一现场就是它。
+$CACHE_DIR  = (Join-Path $PSScriptRoot '..\Cache')
 #   【是什么】KV/会话磁盘缓存根目录（被下面 $KV_DISK_PATH 使用）。
 #   【效果】E: 是机械盘，改到 NVMe 上会明显加快溢出读写；进程退出时缓存自动清理。
 
 # ============================================================
 # 二、网络与 API
 # ============================================================
-$BIND_HOST            = "0.0.0.0"
+$BIND_HOST            = "127.0.0.1"
 #   【是什么】服务监听地址。0.0.0.0 = 局域网可访问；127.0.0.1 = 只本机能连。
 #   【什么时候改】只自己用 → 127.0.0.1 更安全；要给局域网其他机器用 → 0.0.0.0（注意无认证风险）。
 #   【★ 为什么变量叫 $BIND_HOST 不叫 $HOST】$Host 是 PowerShell 的只读自动变量，
@@ -129,7 +125,13 @@ $MAX_PENDING_REQUESTS = ""
 $PENDING_TIMEOUT_MS   = ""
 #   【是什么】排队+准备阶段的超时（毫秒，默认 600000 = 10 分钟）。
 #   【★ 什么时候要调大】长任务（长文档 prefill、思考很长）会被误判超时 503；
-#     默认 10 分钟对 1M 上下文可能不够，长档场景建议 1800000（30 分钟）。
+#     默认 10 分钟对 1M 上下文可能不够，长档场景建议 1800000（30 分钟）；本机生产脚本已设 3600000（1 小时）。
+$WEBUI_REQUEST_TIMEOUT_MS = "3600000"
+#   【是什么】内置 WebUI 等待一次对话响应的超时（毫秒）→ 服务端参数 --webui-request-timeout-ms。
+#   【默认 3600000 = 1 小时】长 prompt 的 KVMem prefill 需要 15-30 分钟，避免浏览器侧误报"服务器超时"。
+#   【0 = 不设前端超时】WebUI 不主动中止请求，只受浏览器/网络限制。
+#   【怎么生效】服务端把该值放在 /props 的 webui.request_timeout_ms，WebUI 页面启动时读取并应用；
+#     改本行 + 重启服务即可，无需改动 WebUI 文件。
 $RECOVER_INVARIANT    = ""
 #   【是什么】引擎内部不变量损坏时，"只失败当前请求"还是"整个服务退出"。
 #   【留空=关引擎（默认）/ "1"=保持服务】长跑服务建议开，避免一个坏请求拖垮整个进程。
@@ -162,7 +164,7 @@ $PREFILL_CHUNK    = ""
 #   【取值约束】必须是 128 的倍数、且 <= R（生成预留）。默认 1024。
 #   【效果】越大，prefill 越快；但需要更大的 R 撑住。默认 R=5632 时一般不用动。
 #   【什么时候改】极限 prefill 速度可试 2048；改了要同步确认 R 够。
-$DEFAULT_MAX_TOK  = ""
+$DEFAULT_MAX_TOK  = "524288"
 #   【这是什么】请求没写 max_tokens 时，默认最多生成多少 token。
 #   【★ 最容易踩的坑：thinking 也算这个预算】模型先"想"再答，想的 token 从 max_tokens 里扣。
 #     给太小（如 32/64）会出现"回答为空、finish_reason=length"——这不是召回失败，是预算被思考吃光。
@@ -202,17 +204,22 @@ $KV_PROFILE       = "long"
 switch ($KV_PROFILE) {
     "long"  { $KV_BUDGET = "32768"; $KV_GEN_RESERVE = "5632"; $MAX_CONCURRENCY = "1" }
     "dual"  { $KV_BUDGET = "16384"; $KV_GEN_RESERVE = "2816"; $MAX_CONCURRENCY = "2" }
+    "fast19k" { $KV_BUDGET = "16384"; $KV_GEN_RESERVE = "2816"; $MAX_CONCURRENCY = "1" }
     "max8"  { $KV_BUDGET = "3264";  $KV_GEN_RESERVE = "1536"; $MAX_CONCURRENCY = "8" }
-    default { throw "KV_PROFILE must be long | dual | max8" }
+    default { throw "KV_PROFILE must be long | dual | max8 | fast19k" }
 }
 $KV_HOST_MIB      = "auto"
 #   【这是什么】主机内存里给历史 KV 的预算 H。取值：MiB 或 "auto"。
 #   【auto 是多少】物理内存 − 1 GiB（64 GB 机器上实测 64421 MiB）。
 #   【什么时候改】想让出内存给别的程序 → 显式调小（如 32768）；一般保持 auto。
-$KV_SESSIONS      = "4"
-#   【这是什么】主机层里同时保留几个会话的历史（多 Agent/多客户端场景）。
-#   【效果】多会话能各自恢复前缀；越多越吃主机内存（每会话一份历史）。
-#   【怎么选】单人用 → 4 足够；多个长期 Agent 并行 → 8/16。
+$KV_SESSIONS      = "1"
+#   【这是什么】主机层里同时保留几个会话的历史（多 Agent/多客户端场景），取值 1..16。
+#   【效果】多会话能各自恢复前缀（切换更快）；越多越吃主机内存（每会话一份历史）。
+#   【为什么默认 1（2026-10-21 用户裁定）】保留多个会话历史时，长上下文请求之后新开的对话
+#     会复用旧会话信息，导致新对话输出多样性下降（回答变短、模板化）；实测 sessions > 1
+#     可复现、sessions = 1 明显改善。详见 `指南\已知问题与运行时限制.md` §11。
+#   【什么时候调大】多个长期 Agent 并行、且更看重会话切换速度时，可试 4/8/16；
+#     代价是上述多样性问题概率上升、主机内存占用增加。
 $KV_SINK_TOKENS   = "4096"
 #   【这是什么】"永久保留的开头"：从第 1 个 token 起，前 N 个 token 永不驱逐（计入 B）。
 #   【为什么需要它】system 提示、任务描述、角色设定通常在最前面；按滑窗会被挤掉。
@@ -228,12 +235,12 @@ $KV_RECENT_TOKENS = "1024"
 # ============================================================
 # 五、KVMem 检索与打分（决定"旧历史里哪些片段值得换回显存"）
 # ============================================================
-# 【先理解问题】显存里只有 3.84 万 token 的窗口，但 1M 历史都在主机/SSD。
-#   每一轮对话引擎都要挑"哪 3.84 万个 token 换进来"。挑法有两层：
+# 【先理解问题】显存里只有 38.4K Token 的窗口，但 1M 历史都在主机/SSD。
+#   每一轮对话引擎都要挑"哪 38.4K Token 换进来"。挑法有两层：
 #     1) 用当前问题去和每个旧块算相似度（见第七·补节的 ActKV 打分器）
 #     2) 记"这个块历史上被用过多少次"（本节的 LRFU）
 #   两者叠加：LRFU 不改变"当前问题"的相似度，只给"长期被反复用到"的块加权。
-# 【实测】8 针 4 万 token 判据下 LRFU 开/关都是 8/8 全中、速度无差异
+# 【实测】8 针 40K Token 判据下 LRFU 开/关都是 8/8 全中、速度无差异
 #   ⇒ 生产默认关。什么时候值得开：长会话里反复回到同一主题（长期项目助手）。
 # ============================================================
 $KV_LRFU          = ""
@@ -265,13 +272,15 @@ $KV_VERIFY_XFER   = ""
 # 六、KVMem 磁盘分层（主机内存也装不下时，把历史溢到 SSD）
 # ★ 默认落在解压目录 Cache；放到 NVMe 盘会明显加快换入换出
 # ============================================================
-$KV_DISK_PATH     = Join-Path $PSScriptRoot "..\Cache\kvmem"
-#   【是什么】历史 KV 溢出到磁盘时写哪个目录。必须与 $KV_DISK_MIB 成对给。
+$KV_DISK_PATH     = ""
+#   【是什么】历史 KV 溢出到磁盘时写哪个目录。**必须与 $KV_DISK_MIB 成对给**，只给一个引擎会拒启
+#     （实测报错：KVMem SSD requires both --kvmem-disk-path and --kvmem-disk-mib）。
+#   【默认值】$CACHE_DIR\kvmem（与上方 $CACHE_DIR 一致）；改到 NVMe 会明显加快换入换出。
 #   【什么时候会用到】只有主机内存（$KV_HOST_MIB）也装不下时才写盘；
 #     1M int8 历史约 29 GiB、主机预算约 63 GiB ⇒ 单会话通常不溢盘，多会话/超长才用到。
 #   【生命周期】进程内有效，进程退出即删（不会长期占盘）。
 #   【盘速影响】换入换出速度 = 盘速；放到 NVMe 盘上会明显更快。
-$KV_DISK_MIB      = "102400"
+$KV_DISK_MIB      = ""
 #   【是什么】磁盘层最多能用多少 MiB（默认 100 GiB）。防止异常情况下写爆盘。
 #   【怎么选】≥ 你预期的最坏溢出量；1M int8 约 29 GiB，100 GiB 足够。
 $DISK_KV_PATH     = ""
@@ -310,8 +319,8 @@ $KV_HEADROOM_MIB  = ""
 # 七·补、ActKV 三支柱
 # ------------------------------------------------------------
 # 【先讲清它在解决什么】
-#   1M 上下文不等于"显存里能同时看 1M"。显卡一次只能看 3.84 万 token 的窗口，
-#   所以每一轮都要决定：历史的哪 3.84 万 token 换进显存？
+#   1M 上下文不等于"显存里能同时看 1M"。显卡一次只能看 38.4K Token 的窗口，
+#   所以每一轮都要决定：历史的哪 38.4K Token 换进显存？
 #   朴素做法有两种，都有病：
 #     · 只看最近（滑窗）→ 开头的系统提示、任务描述、关键密码被挤掉，模型"失忆"。
 #     · 只看高频（频率）→ 多轮 Agent 里任务指令每轮一字不差，检索退化成只记高频词。
@@ -323,7 +332,7 @@ $KV_HEADROOM_MIB  = ""
 #     ③（默认 mean-k，$KV_RETRIEVAL_METHOD）决定"哪些块值得换回来"的打分方式
 #        → 解决"块太粗，一个相关小块被整块平均稀释"。
 # 【实测结论（为什么三根都保持默认）】
-#   判据 = 8 个密码散布在 4 万 token 的 5%~89% 位置、一次请求全部列出。
+#   判据 = 8 个密码散布在 40K Token 的 5%~89% 位置、一次请求全部列出。
 #   · 默认（①开、②关、③mean-k）：8/8 全中，短 decode 94.1 tok/s
 #   · ActKV ②③+LRFU 全开：也是 8/8，但短 decode 93.2（−1%）
 #   ⇒ 默认配置已满分、全开净亏 1% ⇒ 生产保持默认；下面参数是"以后遇到更难场景再开"的开关。
@@ -487,13 +496,15 @@ $PREFIX_CACHE_FILE= ""
 #   【实测】MTP draft=2 → 80.3 tok/s / 接受率 91.4%（最优）；draft=4 → 66.8 / 52.1%；无 MTP → 44.9。
 #   【为什么默认关闭】n-gram 关闭（宽度 31 有对齐崩溃风险、默认路径也偶发）⇒ $NGRAM_DRAFT = "0"。
 # ============================================================
-$SPEC             = "mtp"
+$SPEC             = ""
 #   【是什么】投机解码后端。留空=关 / mtp / dflash / dflash2。
 #   【为什么用 mtp】实测 decode +70%（44.9 → 80.3 tok/s）。
 #   【★ dflash/dflash2 与 KVMem 互斥】KVMem 模式下只能用 mtp（本包就是 KVMem 模式）。
-$DRAFT_TOKENS     = "2"
+$DRAFT_TOKENS     = ""
 #   【是什么】MTP 每轮一次猜几个 token（草稿宽度）。取值 1..15。
-#   【★ 必须给】--spec mtp 必须同时给 --draft-tokens，否则引擎直接退出。
+#   【★ 必须给】--spec mtp 必须同时给 --draft-tokens 1..15，否则引擎直接退出；
+#     上游 ninfer 同样没有"模型自带默认值"可回落（2026-10-21 核对 8319e8f5 源码）。
+#     本脚本**不自动补默认值**（2026-10-21 用户裁定）：请按下面实测值显式填写。
 #   【实测怎么选的】同一二进制三档各重复 2 次：
 #     draft=2 → 80.3 / 79.2 tok/s，接受率 91.4%   ← 最优
 #     draft=3 → 75.3 tok/s，接受率 69.5%
@@ -559,7 +570,7 @@ $MEDIA_THREADS    = ""
 #   temperature 越低越确定、越高越发散；top_p/top_k/min_p 先砍掉低概率候选再抽。
 # 【默认策略】
 #   采样值由"实际使用时"在请求里配置，脚本全部留空（= 引擎默认）；
-#   只有"思考"按用户要求默认开启且最高档（$REASON_EFFORT = "max"）。
+#   只有"思考"按用户要求默认开启且最高档（$REASON_EFFORT = "xhigh"）。
 # 【★ 一个必须知道的坑】做判据/复现时要在请求里给 temperature=0（或 $GREEDY=1），
 #   否则同一问题两次答案可能不同，看起来像"召回不稳定"。
 # ============================================================
@@ -604,9 +615,10 @@ $THINK_BUDGET     = ""
 #   【★ 默认最高思考 ⇒ 这里留空（不限预算）。】
 $THINK_BUDGET_MSG = ""
 #   【是什么】思考预算用尽时给模型的提示文案。留空=内置文案。
-$REASON_EFFORT    = "max"
+$REASON_EFFORT    = "xhigh"
 #   【是什么】默认推理强度。取值 none/minimal/low/medium/high/xhigh/max。
-#   【★ 默认：思考开启且最高档 ⇒ 默认 "max"。】
+#   【★ 默认：思考开启且最高档 ⇒ "xhigh"（本模型内置 Qwen3.8 模板只接受 low/medium/xhigh、默认 xhigh；
+#     引擎把 high/max 映射到最近档 xhigh、minimal→low。其他模型模板若接受更多档，可按上行取值选 max 等）。】
 #   【代价】短问答更慢、更费 token（thinking 计入 max_tokens）；单个请求要快时在请求里显式改低。
 
 # ============================================================
@@ -752,7 +764,7 @@ $LOG_LEVEL        = "info"
 #   【是什么】日志级别：trace/debug/info(默认)/warning/error/critical/off。
 #   【info 有什么】容量行 + 每个请求的 req#N done（TTFT/prefill/decode/cache/mtp 接受率）。
 #   【debug 有什么】每一步动作（排查用，很吵、很占盘）。
-$LOG_STATS_MS     = ""
+$LOG_STATS_MS     = "5000"
 #   【是什么】吞吐统计报告间隔（毫秒，默认 5000；0=关）。
 $LOG_COLOURS      = ""
 #   【是什么】控制台着色：on/off。重定向到文件时建议 off（否则日志里有颜色码）。
@@ -790,6 +802,7 @@ if ($WEBUI_MCP_PROXY)     { $a += "--webui-mcp-proxy" }
 if ($MAX_REQUEST_MIB)     { $a += "--max-request-mib";       $a += $MAX_REQUEST_MIB }
 if ($MAX_PENDING_REQUESTS){ $a += "--max-pending-requests";  $a += $MAX_PENDING_REQUESTS }
 if ($PENDING_TIMEOUT_MS)  { $a += "--pending-timeout-ms";    $a += $PENDING_TIMEOUT_MS }
+if ($WEBUI_REQUEST_TIMEOUT_MS) { $a += "--webui-request-timeout-ms"; $a += $WEBUI_REQUEST_TIMEOUT_MS }
 if ($RECOVER_INVARIANT)   { $a += "--recover-invariant-failures" }
 if ($RESP_STORE_RECORDS)  { $a += "--response-store-max-records"; $a += $RESP_STORE_RECORDS }
 if ($RESP_STORE_MIB)      { $a += "--response-store-max-mib";     $a += $RESP_STORE_MIB }
@@ -813,9 +826,13 @@ if ($KV_LRFU_TOPF)        { $a += "--kvmem-lrfu-top-frac";   $a += $KV_LRFU_TOPF
 if ($KV_SCORE_AGG)        { $a += "--kvmem-score-agg";       $a += $KV_SCORE_AGG }
 if ($KV_VERIFY_XFER)      { $a += "--kvmem-verify-transfers" }
 
-# --- KVMem 磁盘分层 ---
-if ($KV_DISK_PATH)        { $a += "--kvmem-disk-path";       $a += $KV_DISK_PATH }
-if ($KV_DISK_MIB)         { $a += "--kvmem-disk-mib";        $a += $KV_DISK_MIB }
+# --- KVMem 磁盘分层（两者必须成对；只配一个引擎会拒启，这里做防御）---
+if ($KV_DISK_PATH -and $KV_DISK_MIB) {
+    $a += "--kvmem-disk-path"; $a += $KV_DISK_PATH
+    $a += "--kvmem-disk-mib";  $a += $KV_DISK_MIB
+} elseif ($KV_DISK_PATH -or $KV_DISK_MIB) {
+    Write-Host '  [警告] $KV_DISK_PATH 与 $KV_DISK_MIB 必须成对配置；当前只配了一项，SSD 层已跳过（否则引擎拒启）' -ForegroundColor Yellow
+}
 if ($DISK_KV_PATH)        { $a += "--disk-kv-path";          $a += $DISK_KV_PATH }
 if ($DISK_KV_GIB)         { $a += "--disk-kv-gib";           $a += $DISK_KV_GIB }
 if ($DISK_KV_RESTORE)     { $a += "--disk-kv-restore" }
@@ -876,6 +893,9 @@ if ($CACHE_TAP_GAP)       { $a += "--cache-tap-min-gap";     $a += $CACHE_TAP_GA
 if ($PREFIX_CACHE_FILE)   { $a += "--prefix-cache-file";     $a += $PREFIX_CACHE_FILE }
 
 # --- 投机解码 ---
+# 注意：--spec mtp 必须由用户**显式**同时给 $DRAFT_TOKENS（1..15），否则引擎报错退出；
+#   上游 ninfer 也没有"模型自带默认值"可回落（2026-10-21 核对 8319e8f5 源码）。
+#   本脚本**不自动补默认值**（2026-10-21 用户裁定）：请按 §九 实测值显式填写。
 if ($SPEC)                { $a += "--spec";                  $a += $SPEC }
 if ($DRAFT_TOKENS)        { $a += "--draft-tokens";          $a += $DRAFT_TOKENS }
 if ($LM_HEAD_DRAFT)       { $a += "--lm-head-draft" }
@@ -983,32 +1003,55 @@ if ($REQ_LOG_KEEP)        { $a += "--request-log-keep";      $a += $REQ_LOG_KEEP
 # =====================================================================
 # 启动
 # =====================================================================
+# ★ 控制台编码设置必须在任何 Write-Host 之前（2026-10-21 用户实测反馈）：
+#   `chcp` 切换控制台代码页、或设置 OutputEncoding，都可能触发控制台重绘；
+#   若放在横幅之后，会把已经打印的启动配置信息冲掉，只剩引擎的早期输出
+#   （表现为"配置信息闪过就消失"）。这里提前到启动段最前，保证横幅与配置稳定可见。
+try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
+try { & cmd /c chcp 65001 > $null } catch { }
+
 $stamp = Get-Date -Format 'yyyy-MM-dd_HH-mm-ss'
 $outLog = Join-Path $LOG_DIR ("server_$stamp.out.log")
 $errLog = Join-Path $LOG_DIR ("server_$stamp.err.log")
 
 Write-Host "------------------------------------------------------------" -ForegroundColor DarkGray
-Write-Host "  KVMem_Ninfer_ActKV_2080Ti v0.1" -ForegroundColor Green
+Write-Host "  KVMem_Ninfer_ActKV_2080Ti v0.1.1" -ForegroundColor Green
 Write-Host ("  引擎 : " + $EXE)
 Write-Host ("  模型 : " + $MODEL)
-Write-Host ("  参数 : " + ($a -join ' '))
-Write-Host ("  API  : http://$BIND_HOST`:$PORT/v1/chat/completions")
-Write-Host ("  日志 : " + $outLog + "  (stdout + stderr)")
+$mtpText   = if ($SPEC) { "$SPEC (draft=$DRAFT_TOKENS)" } else { "关闭" }
+$graphText = if ($NO_CUDA_GRAPH) { "关闭" } else { "开启" }
+$webuiText = if ($NO_WEBUI) { "关闭" } else { "http://127.0.0.1:$PORT/" }
+Write-Host ""
+Write-Host "  -- 当前配置 --" -ForegroundColor Cyan
+Write-Host ("  档位     : " + $KV_PROFILE + "   B=" + $KV_BUDGET + "  R=" + $KV_GEN_RESERVE + "  H=" + $KV_HOST_MIB + "  并发=" + $MAX_CONCURRENCY)
+Write-Host ("  上下文   : " + $MAX_CONTEXT + " tokens")
+Write-Host ("  MTP      : " + $mtpText)
+Write-Host ("  CUDA图   : " + $graphText)
+Write-Host ("  会话保留 : " + $KV_SESSIONS + " 个   sink=" + $KV_SINK_TOKENS + "   recent=" + $KV_RECENT_TOKENS)
+Write-Host ("  超时     : 排队 " + $(if ($PENDING_TIMEOUT_MS) { $PENDING_TIMEOUT_MS + " ms" } else { "默认 600000 ms" }) + " / WebUI " + $(if ($WEBUI_REQUEST_TIMEOUT_MS) { $WEBUI_REQUEST_TIMEOUT_MS + " ms" } else { "默认 3600000 ms" }))
+Write-Host ("  思考     : " + $(if ($REASON_EFFORT) { "effort=" + $REASON_EFFORT } else { "引擎默认" }) + "（本模型模板实际档位：low/medium/xhigh）")
+Write-Host ("  WebUI    : " + $webuiText)
+Write-Host ("  API      : http://" + $BIND_HOST + ":" + $PORT + "/v1")
+Write-Host ("  日志     : " + $outLog + "  (stdout + stderr)")
+Write-Host ""
+Write-Host "  -- 完整启动命令 --" -ForegroundColor Cyan
+Write-Host ("  " + $EXE + " " + ($a -join " "))
+Write-Host ""
 Write-Host "  按 Ctrl+C 停止服务"
 Write-Host "------------------------------------------------------------" -ForegroundColor DarkGray
 
 # PS 5.1 会把引擎写到 stderr 的每一行都当成脚本错误；若 $ErrorActionPreference='Stop'，
 # 引擎刚打印第一行状态就会终止脚本。这里临时放宽为 Continue。
-# 输出策略（v0.1 修复）：stdout+stderr 合并，Tee-Object 同时显示在控制台并写入 out.log；
+# 输出策略（2026-10-19 起）：stdout+stderr 合并，Tee-Object 同时显示在控制台并写入 out.log；
 #   err.log 不再单独产生（旧日志仍可读）。
-try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
-try { & cmd /c chcp 65001 > $null } catch { }
+# 注意：控制台编码已在启动段最前设置好（见"启动"段开头），此处不再重复设置，
+#   避免二次触发控制台重绘，把已打印的横幅与配置信息冲掉。
 $__eap = $ErrorActionPreference
 $ErrorActionPreference = 'Continue'
 try {
     # 引擎日志主要走 stderr：合并 stdout+stderr，控制台实时显示 + 同时落盘到 out.log。
-    # 注意：PowerShell 的 `2>&1` 会把 native stderr 包装成 ErrorRecord（终端红字 +
-    # “所在位置/字符/CategoryInfo/NativeCommandError”的假报错，并原样写进日志）——
+    # 注意：PowerShell 的 `2>&1` 会把 native stderr 包装成 ErrorRecord（终端显示红字 +
+    # “所在位置/字符/CategoryInfo/NativeCommandError”的假报错，且原样写进日志）——
     # 这里把 ErrorRecord 还原成纯文本行再输出，终端和日志都只看到引擎原本的日志。
     & $EXE @a 2>&1 | ForEach-Object {
         if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.Exception.Message } else { $_ }

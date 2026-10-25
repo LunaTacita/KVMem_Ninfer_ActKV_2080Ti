@@ -340,7 +340,7 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         const bool memory_spec_supported = (ordinary || fixed_mtp || adaptive_mtp) && memory_ngram_supported &&
             options.speculative.mtp_attention_window == 0;
 
-        // The Engine re-checks the serve front end's admission (a second, private
+        // The Engine re-checks the serve front end's admission (N31: this is a second, private
         // copy of the same logic; keep both in step). Name the first clause that failed with the
         // value and this machine's limit instead of printing the whole whitelist, so a direct
         // construction (perplexity, tests) stays diagnosable.

@@ -47,6 +47,11 @@ struct ServeOptions {
     // at C1 on an RTX 3090, and a 6.5K-token one past 100 s; a 30 s deadline expired those
     // callers before they were ever admitted.
     std::uint32_t pending_timeout_ms   = 600000;
+    // --webui-request-timeout-ms: how long the built-in WebUI waits for one chat response
+    // before aborting its fetch (0 = no client-side deadline). The static WebUI cannot read
+    // the command line, so this value is exposed on /props and applied there. A KVMem prefill
+    // of a 200K+ token prompt on a 2080 Ti takes 15-30 minutes, hence the one-hour default.
+    std::uint32_t webui_request_timeout_ms = 3600000;
     std::uint32_t prefill_chunk        = 1024;
     bool fast_prefill_kernel           = false;
     std::filesystem::path context_cost_presets;

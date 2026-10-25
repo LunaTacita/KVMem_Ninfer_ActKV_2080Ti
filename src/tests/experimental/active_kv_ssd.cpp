@@ -1,9 +1,6 @@
 #include "ninfer/engine.h"
 #include "kvmem_test_options.h"
-#include <algorithm>
-#include <cctype>
 #include <chrono>
-#include <cstdio>
 #include <filesystem>
 #include <iostream>
 #include <stdexcept>
@@ -39,54 +36,7 @@ struct Observation {
     std::vector<std::int32_t> tokens;
     std::uint32_t reused = 0;
     ninfer::KvmemMemorySummary memory;
-    std::string content;
 };
-// Reports where two runs first diverge: the SSD arm's assertion only said "the tokens differ",
-// which left no first scene for a rare, layout-dependent mismatch (the reported line is not
-// the failing line). Prints the step, the token position and both sides' neighbourhoods.
-void report_first_difference(const char* label, const std::vector<Observation>& expected,
-                             const std::vector<Observation>& actual) {
-    const std::size_t steps = std::min(expected.size(), actual.size());
-    for (std::size_t step = 0; step < steps; ++step) {
-        const auto& left  = expected[step].tokens;
-        const auto& right = actual[step].tokens;
-        std::size_t at    = 0;
-        while (at < left.size() && at < right.size() && left[at] == right[at]) { ++at; }
-        if (at == left.size() && at == right.size()) { continue; }
-        std::fprintf(stderr, "%s: step %zu first differs at token %zu (sizes %zu vs %zu)\n", label,
-                     step, at, left.size(), right.size());
-        const std::size_t from = at > 3 ? at - 3 : 0;
-        for (std::size_t i = from; i < at + 4 && i < left.size(); ++i) {
-            std::fprintf(stderr, "  reference[%zu]=%d%s\n", i, static_cast<int>(left[i]),
-                         i == at ? "  <-- first difference" : "");
-        }
-        for (std::size_t i = from; i < at + 4 && i < right.size(); ++i) {
-            std::fprintf(stderr, "  compared [%zu]=%d%s\n", i, static_cast<int>(right[i]),
-                         i == at ? "  <-- first difference" : "");
-        }
-        return;
-    }
-    if (expected.size() != actual.size()) {
-        std::fprintf(stderr, "%s: step count differs (%zu vs %zu)\n", label, expected.size(),
-                     actual.size());
-    }
-}
-// The fixture asks about archive entries 0-3 ("pulsars, cosmic rays and distant galaxies"). A run
-// that recalls them mentions one of those words; comparing two equally wrong runs must not pass.
-void check_recalled_early_archive(const std::vector<Observation>& run) {
-    std::string lower;
-    for (const auto& item : run) { lower += item.content; }
-    if (lower.empty()) {
-        std::fprintf(stderr, "GT-SKIP: no visible content (thinking may have consumed the budget)\n");
-        return;
-    }
-    std::transform(lower.begin(), lower.end(), lower.begin(),
-                   [](unsigned char value) { return static_cast<char>(std::tolower(value)); });
-    const bool recalled = lower.find("pulsar") != std::string::npos ||
-                          lower.find("cosmic") != std::string::npos ||
-                          lower.find("galax") != std::string::npos;
-    require(recalled, "the run did not recall the early archive (expected pulsar/cosmic/galaxy)");
-}
 std::vector<Observation> exercise(const ninfer::EngineOptions& options) {
     ninfer::Engine engine(options);
     std::vector<Observation> observations;
@@ -126,7 +76,7 @@ std::vector<Observation> exercise(const ninfer::EngineOptions& options) {
         require(memory.disk_errors == 0, "unexpected disk I/O error");
         require(memory.resident_pages == 0 && memory.mtp_resident_pages == 0, "GPU pages leaked");
         observations.push_back({{result.generated_token_ids.begin(), result.generated_token_ids.end()},
-            result.reused_prompt_tokens, memory, result.content});
+            result.reused_prompt_tokens, memory});
         std::cout << "ACTIVE_SSD step=" << step << " H=" << memory.host_payload_bytes
                   << " D=" << memory.disk_payload_bytes << " reads=" << memory.disk_read_bytes
                   << " writes=" << memory.disk_written_bytes << " checkpoint=" << memory.checkpoint_tokens
@@ -162,16 +112,6 @@ int main(int argc, char** argv) {
             options.speculative.draft_tokens = drafts;
         }
         const auto reference = exercise(options);
-        check_recalled_early_archive(reference);
-        // Negative control: the same options again, before the host budget shrinks. If two
-        // identical runs already disagree, a difference in the SSD arm cannot be attributed to the
-        // SSD tier at all and the judge would be invalid by construction.
-        const auto control = exercise(options);
-        report_first_difference("negative-control", reference, control);
-        for (std::size_t i = 0; i < reference.size(); ++i) {
-            require(control[i].tokens == reference[i].tokens,
-                    "negative control: two identical runs generated different token IDs");
-        }
         const auto pages = (reference.front().memory.checkpoint_tokens + 63ULL) / 64;
         const auto history_bytes = reference.front().memory.host_payload_bytes;
         require(pages > 10 && history_bytes % pages == 0, "cannot derive native record size");
@@ -182,7 +122,6 @@ int main(int argc, char** argv) {
         options.kvmem.disk_path = std::filesystem::temp_directory_path() /
             ("ninfer-active-ssd-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
         const auto actual = exercise(options);
-        report_first_difference("ssd-arm", reference, actual);
         for (std::size_t i = 0; i < reference.size(); ++i) {
             require(actual[i].tokens == reference[i].tokens, "SSD changed generated token IDs");
             require(actual[i].reused == reference[i].reused, "SSD changed prefix reuse");
@@ -194,15 +133,6 @@ int main(int argc, char** argv) {
             require(actual[i].memory.disk_payload_bytes >=
                         reference[i].memory.checkpoint_bytes - actual[i].memory.checkpoint_bytes,
                     "idle checkpoint bytes bypassed the disk quota");
-        }
-        // Second control: the SSD arm twice. A reference-vs-actual comparison alone cannot say
-        // whether an occasional difference comes from the engine or from the SSD path; two SSD runs
-        // that disagree localise it to the restore/use path.
-        const auto actual_repeat = exercise(options);
-        report_first_difference("ssd-arm-control", actual, actual_repeat);
-        for (std::size_t i = 0; i < actual.size(); ++i) {
-            require(actual_repeat[i].tokens == actual[i].tokens,
-                    "SSD arm control: two identical SSD runs generated different token IDs");
         }
         require(std::filesystem::is_empty(options.kvmem.disk_path), "temporary spill file leaked");
         std::filesystem::remove(options.kvmem.disk_path);

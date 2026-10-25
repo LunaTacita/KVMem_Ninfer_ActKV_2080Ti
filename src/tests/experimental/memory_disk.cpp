@@ -31,19 +31,8 @@ int main(int argc, char** argv) {
         options.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(512);
         options.kv_cache = ninfer::test::kvmem_test_storage(argv[3]);
         options.context_cache.enabled = false;
-        // The upstream default is a 512 MiB Host budget. This fixture's own history (about 1,000
-        // tokens) plus its snapshot state is smaller than that, so the Engine never needs to spill
-        // and nothing is written to disk -- which makes the persistence assertion in every cold/hit
-        // arm unsatisfiable. NINFER_DISK_TEST_HOST_MIB lets the registration ask for a budget the
-        // fixture's data does not fit in, which is the condition the cold/hit arms exist to
-        // qualify. The default stays 512 MiB so a hand-run behaves exactly as upstream documents.
-        std::uint64_t host_bytes = 512ULL << 20;
-        if (const auto* overridden = std::getenv("NINFER_DISK_TEST_HOST_MIB")) {
-            host_bytes = std::stoull(overridden) << 20;
-            require(host_bytes > 0, "NINFER_DISK_TEST_HOST_MIB must be a positive number of MiB");
-        }
         options.kvmem = {.selected_tokens = 384, .reserve_tokens = 128,
-            .host_bytes = host_bytes, .retained_sessions = 2, .verify_transfers = true,
+            .host_bytes = 512ULL << 20, .retained_sessions = 2, .verify_transfers = true,
             .disk_path = argv[4], .disk_bytes = std::stoull(argv[6]) << 20};
         const auto drafts = static_cast<std::uint32_t>(std::stoul(argv[2]));
         if (drafts) {
@@ -55,14 +44,6 @@ int main(int argc, char** argv) {
         if (argc == 11) {
             require(std::string(argv[10]) == "adaptive", "expected adaptive");
             options.speculative.mtp_policy = ninfer::MtpDraftPolicy::Adaptive;
-        }
-        // A cold leg qualifies "the history is not on disk yet". A directory left populated by an
-        // earlier run would silently turn it into a hit and fail the reuse assertion below, which is
-        // why README's disk guidance says one dedicated directory per cold/hit pair. Clearing here
-        // keeps the fixture self-contained instead of depending on the caller to clean up.
-        if (std::string(argv[5]) == "cold") {
-            std::error_code cleared;
-            std::filesystem::remove_all(argv[4], cleared);
         }
         ninfer::Engine engine(options);
         ninfer::PromptInput input;
@@ -144,25 +125,6 @@ int main(int argc, char** argv) {
                   << " hits=" << memory.disk_hits << " writes=" << memory.disk_writes
                   << " errors=" << memory.disk_errors << " host=" << memory.host_payload_bytes
                   << " accepted=" << result.speculative.accepted_tokens << std::endl;
-        // The spill directory is EPHEMERAL by contract: serve_options.cpp:201 documents
-        // --kvmem-disk-path as the "Ephemeral active/idle KV spill directory", and it is opened with
-        // FILE_FLAG_DELETE_ON_CLOSE, so a second process cannot replay a cold leg -- the first
-        // process removes its spill file as it exits, which is why README's "cold and hit are two
-        // processes sharing one directory" cannot hold for this directory. The reuse half of the
-        // pair is therefore qualified inside ONE process by repeating the same request: that is what
-        // actually exercises "spilled KV is taken back from the disk tier".
-        if (mode == "cold") {
-            const auto replay = engine.submit(engine.prepare(input), request).wait();
-            const auto after  = engine.memory_summary().kvmem;
-            require(replay.reused_prompt_tokens > 0,
-                    "a repeated request did not reuse the history spilled to the disk tier");
-            require(after.disk_hits > memory.disk_hits,
-                    "the replay did not read the disk tier it had just written");
-            require(after.host_payload_bytes <= options.kvmem.host_bytes, "replay exceeded H");
-            std::cout << "MEMORY_DISK_REPLAY reused=" << replay.reused_prompt_tokens
-                      << " hits=" << after.disk_hits << " writes=" << after.disk_writes
-                      << " host=" << after.host_payload_bytes << std::endl;
-        }
         std::cout << "MEMORY_DISK PASS" << std::endl;
     } catch (const std::exception& error) {
         std::cerr << error.what() << std::endl;

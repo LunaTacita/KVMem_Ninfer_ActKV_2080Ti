@@ -2,6 +2,7 @@
 #include "models/qwen3_5/program/context.h"
 #include "models/qwen3_5/program/context_work.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
@@ -322,7 +323,17 @@ public:
         }
         destructive = true;
         p.text_kv_addresses->destructive_truncate(seq.kv->text, 0);
-        const auto compact_end = static_cast<std::uint32_t>(plan.next.visible_tokens) + backend.end - seq.text_kv_valid;
+        // Three quantities with different lifetimes meet here: the plan's compact visible-token
+        // count, the backend's logical restore end, and the sequence's committed logical frontier.
+        // Computing the compact end in uint32 wraps to ~2^32 as soon as backend.end trails
+        // text_kv_valid, and the wrap then sizes the table mapping instead of a real frontier.
+        const std::int64_t compact_end64 =
+            static_cast<std::int64_t>(plan.next.visible_tokens) +
+            static_cast<std::int64_t>(backend.end) -
+            static_cast<std::int64_t>(seq.text_kv_valid);
+        const auto compact_end = static_cast<std::uint32_t>(
+            std::clamp<std::int64_t>(compact_end64, 0,
+                                     static_cast<std::int64_t>(p.kvmem_window_tokens)));
         p.text_kv_addresses->ensure_mapped_to_tokens(seq.kv->text, compact_end, p.compute_streams);
         if (backend.mtp_layout) {
             p.backend_kv_addresses->destructive_truncate(*seq.kv->backend, 0);

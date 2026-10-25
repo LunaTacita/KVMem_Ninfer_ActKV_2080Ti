@@ -10,6 +10,7 @@
 #include "serve/request_log.h"
 #include "serve/serve_metrics.h"
 #include "serve/serve_options.h"
+#include "serve/stream_sessions.h"
 #include "serve/text_completion.h"
 
 #include <httplib.h>
@@ -176,6 +177,11 @@ private:
     void handle_rerank(const httplib::Request& req, httplib::Response& res);
     void handle_props(const httplib::Request& req, httplib::Response& res) const;
     void handle_webui(const httplib::Request& req, httplib::Response& res) const;
+    // Resumable chat streams: GET replays a session buffer from a byte offset, POST looks up the
+    // sessions a reloaded page may continue, DELETE releases (and stops) one.
+    void handle_stream_replay(const httplib::Request& req, httplib::Response& res);
+    void handle_stream_lookup(const httplib::Request& req, httplib::Response& res);
+    void handle_stream_cancel(const httplib::Request& req, httplib::Response& res);
 
     // What the server reports about one loaded model, computed once per Engine instance: an
     // unload and a later load start a new one.
@@ -233,6 +239,8 @@ private:
     mutable std::mutex facts_mutex_;
     mutable std::map<std::string, ModelFacts> facts_;
     OpenAIResponsesStore openai_responses_store_;
+    // Replay buffers of resumable chat streams (X-Conversation-Id opt-in); see stream_sessions.h.
+    StreamSessionRegistry stream_sessions_;
     OperationalLog operational_log_;
     // Mutable: a model's server_start record is written when a const handler first sees it.
     mutable JsonlRequestLog request_jsonl_;
